@@ -7,6 +7,9 @@ import os
 import shutil
 import numpy as np
 
+import random
+import accelerate
+
 import diffusers
 import math
 import torch
@@ -25,15 +28,19 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, AutoProcessor
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.models import AutoencoderKL
+from diffusers import UniPCMultistepScheduler
+
 
 from ootd.pipelines_ootd.pipeline_ootd import OotdPipeline
 
 from ootd.pipelines_ootd.unet_garm_2d_condition import UNetGarm2DConditionModel
 from ootd.pipelines_ootd.unet_vton_2d_condition import UNetVton2DConditionModel
+from ootd.inference_ootd import VDPDiffusion
 
 from dataset import VDPDataset
+#from val_metrics import generate_images_from_vdp_pipe
 
-from val_metrics import compute_metrics
+#from val_metrics import compute_metrics
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
@@ -187,10 +194,10 @@ def parse_args():
     return args
 
 
-VIT_PATH = "../checkpoints/clip-vit-large-patch14"
-VAE_PATH = "../checkpoints/ootd"
-UNET_PATH = "../checkpoints/ootd/ootd_hd/checkpoint-36000"
-MODEL_PATH = "../checkpoints/ootd"
+VIT_PATH = "openai/clip-vit-large-patch14"
+VAE_PATH = "runwayml/stable-diffusion-v1-5"
+UNET_PATH = "runwayml/stable-diffusion-v1-5"
+MODEL_PATH = "runwayml/stable-diffusion-v1-5"
 
 
 def main():
@@ -221,26 +228,32 @@ def main():
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
+    
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     vae = AutoencoderKL.from_pretrained(
-            VAE_PATH,
-            subfolder="vae",
-            torch_dtype=torch.float16,
-        )
+        VAE_PATH,
+        subfolder="vae",
+        torch_dtype=torch.float16,
+    )
 
     unet_garm = UNetGarm2DConditionModel.from_pretrained(
         UNET_PATH,
-        subfolder="unet_garm",
-        torch_dtype=torch.float16,
+        subfolder="unet",
+        torch_dtype=torch.float32,
         use_safetensors=True,
     )
     unet_vton = UNetVton2DConditionModel.from_pretrained(
         UNET_PATH,
-        subfolder="unet_vton",
-        torch_dtype=torch.float16,
+        subfolder="unet",
+        torch_dtype=torch.float32,
         use_safetensors=True,
     )
     
@@ -266,9 +279,9 @@ def main():
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    auto_processor.requires_grad_(False)
+    #auto_processor.requires_grad_(False)
     image_encoder.requires_grad_(False)
-    image_processor.requires_grad_(False)
+    #image_processor.requires_grad_(False)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -279,8 +292,8 @@ def main():
 
     if args.gradient_checkpointing:
         # Enable gradient checkpointing for memory efficient training
-        unet_denoising.enable_gradient_checkpointing()
-        unet_outfitting.enable_gradient_checkpointing()
+        unet_garm.enable_gradient_checkpointing()
+        unet_vton.enable_gradient_checkpointing()
 
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -289,7 +302,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
 
     # Initialize the optimizer
-    params_to_optimize = list(unet_denoising.parameters()) + list(unet_outfitting.parameters())
+    params_to_optimize = list(unet_garm.parameters()) + list(unet_vton.parameters())
     optimizer = torch.optim.AdamW(
         params_to_optimize,
         lr=args.learning_rate,
@@ -302,13 +315,15 @@ def main():
     train_dataset = VDPDataset(
         path=args.trainset_path,
         image_processor=image_processor,
-        size: Tuple[int, int] = (512, 384)
+        auto_processor=auto_processor,
+        size=(512, 512),
     )
 
     test_dataset = VDPDataset(
         path=args.testset_path,
         image_processor=image_processor,
-        size: Tuple[int, int] = (512, 384)
+        auto_processor=auto_processor,
+        size=(512, 512),
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -345,8 +360,8 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     
-    unet_outfitting, unet_denoising,  optimizer, train_dataloader, lr_scheduler, test_dataloader = accelerator.prepare(
-        unet_outfitting, unet_denoising, optimizer, train_dataloader, lr_scheduler, test_dataloader
+    unet_garm, unet_vton,  optimizer, train_dataloader, lr_scheduler, test_dataloader = accelerator.prepare(
+        unet_garm, unet_vton, optimizer, train_dataloader, lr_scheduler, test_dataloader
     )
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vision_encoder = None
@@ -409,8 +424,8 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet_denoising.train()
-        unet_outfitting.train()
+        unet_garm.train()
+        unet_vton.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
@@ -419,25 +434,31 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            with accelerator.accumulate(unet_denoising), accelerator.accumulate(unet_outfitting):
+            with accelerator.accumulate(unet_garm), accelerator.accumulate(unet_vton):
                 caption = batch["caption"]
-                img_aug = batch["img_aug"]
-                img = batch["img"]
+                img_aug = batch["img_aug"].to(device=accelerator.device, dtype=weight_dtype)
+                img = batch["img"].to(device=accelerator.device, dtype=weight_dtype)
+                prompt_image = batch["prompt_img"].data['pixel_values'].to(device=accelerator.device, dtype=weight_dtype)
 
-                prompt_image = auto_processor(images=img_aug, return_tensors="pt").to(accelerator.device)
-                prompt_image = image_encoder(prompt_image.data['pixel_values']).image_embeds
+
+                print(f"img_aug.shape: {img_aug.shape}")
+                print(f"img.shape: {img.shape}")
+                print(f"batch size: {len(batch)}")
+
+                prompt_image = image_encoder(prompt_image.squeeze(1)).image_embeds
                 prompt_image = prompt_image.unsqueeze(1)
 
-                prompt_embeds = tokenizer([caption], max_length=3, padding="max_length", truncation=True, return_tensors="pt")
-                prompt_embeds = text_encoder(prompt_embeds.to(accelerator.device))[0]
+                prompt_embeds = tokenizer(caption, max_length=77, padding="max_length", truncation=True, return_tensors="pt")
+                prompt_embeds = text_encoder(prompt_embeds.input_ids.to(accelerator.device))[0]
 
                 prompt = torch.cat([prompt_embeds, prompt_image], dim=1)
 
                 # Set timesteps
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                bsz = img.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=accelerator.device)
                 timesteps = timesteps.long()
 
-                batch_size = len(batch)
+                seed = random.randint(0, 2147483647)
                 generator = torch.manual_seed(seed)
 
                 # 5. Prepare Image latents
@@ -461,7 +482,9 @@ def main():
                 noise = torch.randn_like(img_latents)
                 
                 # unet_outfitting_encoder_hidden_states = encode_text_word_embedding(text_encoder, tokenized_text, cloth_clip, args.num_vstar).last_hidden_state
-
+                print("img_latents",img_latents.shape)
+                print("noise",noise.shape)
+                print("timesteps",timesteps.shape)
                 denoising_unet_input = noise_scheduler.add_noise(img_latents, noise, timesteps)
 
                 # predict the noise residual
@@ -528,19 +551,34 @@ def main():
                                 requires_safety_checker=False,
                             ).to(accelerator.device, dtype=weight_dtype)
 
-                            val_pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+
+                            val_pipe.scheduler = UniPCMultistepScheduler.from_config(val_pipe.scheduler.config)
+
+                            inference_ootd = VDPDiffusion(accelerator.device)
+                            inference_ootd.pipe = val_pipe
+                            inference_ootd.auto_processor = auto_processor
+                            inference_ootd.image_encoder = image_encoder
+                            inference_ootd.tokenizer = tokenizer
+                            inference_ootd.text_encoder = text_encoder
 
 
                             # Extract the images
                             with torch.cuda.amp.autocast():
-                                generate_images_from_tryon_pipe(val_pipe, inversion_adapter, test_dataloader,
-                                                                args.output_dir, args.test_order,
-                                                                f"imgs_step_{global_step}",
-                                                                args.text_usage, vision_encoder, processor,
-                                                                args.cloth_input_type, num_vstar=args.num_vstar)
+                                images = inference_ootd(model_type='hd',
+                                                        category='upperbody',
+                                                        image_garm=None,
+                                                        image_vton=None,
+                                                        mask=None,
+                                                        image_ori=None,
+                                                        num_samples=1,
+                                                        num_steps=20,
+                                                        image_scale=1.0,
+                                                        seed=-1)
+                                
 
                             # Compute the metrics
                             ### TODO: Bizim datasetimiz için çalışıyor mu bi bak. tüm metrikleri veren bir fonksiyon
+                            """
                             metrics = compute_metrics(
                                 os.path.join(args.output_dir, f"imgs_step_{global_step}_{args.test_order}"),
                                 args.test_order,
@@ -548,7 +586,7 @@ def main():
 
                             print(metrics, flush=True)
                             accelerator.log(metrics, step=global_step)
-
+                            """    
                             # Delete old checkpoints
                             dirs = os.listdir(os.path.join(args.output_dir, "checkpoint"))
                             dirs = [d for d in dirs if d.startswith("checkpoint")]
@@ -600,6 +638,19 @@ def prepare_latents(batch_size, num_channels_latents, height, width, dtype, devi
     latents = latents * self.scheduler.init_noise_sigma
     return latents
 
+
+
+def set_seed(seed):
+    """
+    Set seed for reproducibility.
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    accelerate.utils.set_seed(seed)
 
 if __name__ == "__main__":
     main()
