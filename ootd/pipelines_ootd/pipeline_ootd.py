@@ -291,12 +291,14 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         image_garm = self.image_processor.preprocess(image_garm)
         image_vton = self.image_processor.preprocess(image_vton)
         image_ori = self.image_processor.preprocess(image_ori)
+        """
         mask = np.array(mask)
         mask[mask < 127] = 0
         mask[mask >= 127] = 255
         mask = torch.tensor(mask)
         mask = mask / 255
         mask = mask.reshape(-1, 1, mask.size(-2), mask.size(-1))
+        """
 
         # 4. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -313,9 +315,9 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             generator,
         )
 
-        vton_latents, mask_latents, image_ori_latents = self.prepare_vton_latents(
+        """
+        vton_latents, image_ori_latents = self.prepare_vton_latents(
             image_vton,
-            mask,
             image_ori,
             batch_size,
             num_images_per_prompt,
@@ -324,8 +326,10 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             self.do_classifier_free_guidance,
             generator,
         )
+        """
 
-        height, width = vton_latents.shape[-2:]
+        #height, width = vton_latents.shape[-2:]
+        height, width = garm_latents.shape[-2:]
         height = height * self.vae_scale_factor
         width = width * self.vae_scale_factor
 
@@ -364,8 +368,8 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
                 # concat latents, image_latents in the channel dimension
                 scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                latent_vton_model_input = torch.cat([scaled_latent_model_input, vton_latents], dim=1)
-                # latent_vton_model_input = scaled_latent_model_input + vton_latents
+                # latent_vton_model_input = torch.cat([scaled_latent_model_input, vton_latents], dim=1)
+                latent_vton_model_input = scaled_latent_model_input
 
                 spatial_attn_inputs = spatial_attn_outputs.copy()
 
@@ -406,7 +410,7 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
+                """
                 init_latents_proper = image_ori_latents * self.vae.config.scaling_factor
 
                 # repainting
@@ -416,7 +420,9 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         init_latents_proper, noise, torch.tensor([noise_timestep])
                     )
 
-                latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
+                # latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
+                """
+                #latents = init_latents_proper + latents
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -427,7 +433,7 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                    vton_latents = callback_outputs.pop("vton_latents", vton_latents)
+                    #vton_latents = callback_outputs.pop("vton_latents", vton_latents)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -504,6 +510,7 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             if isinstance(self, TextualInversionLoaderMixin):
                 prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
 
+            ####################### a1
             text_inputs = self.tokenizer(
                 prompt,
                 padding="max_length",
@@ -511,6 +518,7 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 truncation=True,
                 return_tensors="pt",
             )
+            ####################### ?
             text_input_ids = text_inputs.input_ids
             untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
@@ -530,16 +538,19 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             else:
                 attention_mask = None
 
+            ####################### a2
             prompt_embeds = self.text_encoder(
                 text_input_ids.to(device),
                 attention_mask=attention_mask,
             )
+            ####################### ?
             prompt_embeds = prompt_embeds[0]
 
         prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
+        ####################### ?
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
@@ -742,7 +753,7 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         return image_latents
     
     def prepare_vton_latents(
-        self, image, mask, image_ori, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, generator=None
+        self, image, image_ori, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, generator=None
     ):
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
             raise ValueError(
@@ -772,16 +783,17 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             else:
                 image_latents = self.vae.encode(image).latent_dist.mode()
                 image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
-
+        """
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))
         )
         mask = mask.to(device=device, dtype=dtype)
+        """
 
         if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
             additional_image_per_prompt = batch_size // image_latents.shape[0]
             image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
-            mask = torch.cat([mask] * additional_image_per_prompt, dim=0)
+            # mask = torch.cat([mask] * additional_image_per_prompt, dim=0)
             image_ori_latents = torch.cat([image_ori_latents] * additional_image_per_prompt, dim=0)
         elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
             raise ValueError(
@@ -789,14 +801,14 @@ class OotdPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             )
         else:
             image_latents = torch.cat([image_latents], dim=0)
-            mask = torch.cat([mask], dim=0)
+            # mask = torch.cat([mask], dim=0)
             image_ori_latents = torch.cat([image_ori_latents], dim=0)
 
         if do_classifier_free_guidance:
             # uncond_image_latents = torch.zeros_like(image_latents)
             image_latents = torch.cat([image_latents] * 2, dim=0)
 
-        return image_latents, mask, image_ori_latents
+        return image_latents, image_ori_latents
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_freeu
     def enable_freeu(self, s1: float, s2: float, b1: float, b2: float):

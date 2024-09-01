@@ -51,6 +51,7 @@ os.environ["WANDB_START_METHOD"] = "thread"
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+from bitsandbytes.optim import AdamW8bit
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VTO training script.")
@@ -184,6 +185,7 @@ def parse_args():
     parser.add_argument("--test_order", type=str, default="unpaired", choices=["unpaired", "paired"])
     parser.add_argument("--uncond_fraction", type=float, default=0.2, help="Fraction of unconditioned training samples")
 
+    parser.add_argument("--use_8bit_adam", action="store_true", help="Use 8-bit AdamW optimizer.")
 
     args = parser.parse_args()
 
@@ -195,9 +197,9 @@ def parse_args():
 
 
 VIT_PATH = "openai/clip-vit-large-patch14"
-VAE_PATH = "runwayml/stable-diffusion-v1-5"
-UNET_PATH = "runwayml/stable-diffusion-v1-5"
-MODEL_PATH = "runwayml/stable-diffusion-v1-5"
+VAE_PATH = "CompVis/stable-diffusion-v1-4"
+UNET_PATH = "CompVis/stable-diffusion-v1-4"
+MODEL_PATH = "CompVis/stable-diffusion-v1-4"
 
 
 def main():
@@ -303,27 +305,36 @@ def main():
 
     # Initialize the optimizer
     params_to_optimize = list(unet_garm.parameters()) + list(unet_vton.parameters())
-    optimizer = torch.optim.AdamW(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    if args.use_8bit_adam:
+        optimizer = AdamW8bit(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
 
 
     train_dataset = VDPDataset(
         path=args.trainset_path,
         image_processor=image_processor,
         auto_processor=auto_processor,
-        size=(512, 512),
+        size=(16, 16),
     )
 
     test_dataset = VDPDataset(
         path=args.testset_path,
         image_processor=image_processor,
         auto_processor=auto_processor,
-        size=(512, 512),
+        size=(16, 16),
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -364,8 +375,6 @@ def main():
         unet_garm, unet_vton, optimizer, train_dataloader, lr_scheduler, test_dataloader
     )
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vision_encoder = None
-    processor = None
     # Move and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
 
@@ -440,17 +449,15 @@ def main():
                 img = batch["img"].to(device=accelerator.device, dtype=weight_dtype)
                 prompt_image = batch["prompt_img"].data['pixel_values'].to(device=accelerator.device, dtype=weight_dtype)
 
-
-                print(f"img_aug.shape: {img_aug.shape}")
-                print(f"img.shape: {img.shape}")
-                print(f"batch size: {len(batch)}")
-
                 prompt_image = image_encoder(prompt_image.squeeze(1)).image_embeds
                 prompt_image = prompt_image.unsqueeze(1)
 
+                ####################### a1
                 prompt_embeds = tokenizer(caption, max_length=77, padding="max_length", truncation=True, return_tensors="pt")
+                ####################### a2
                 prompt_embeds = text_encoder(prompt_embeds.input_ids.to(accelerator.device))[0]
 
+                ####################### ?
                 prompt = torch.cat([prompt_embeds, prompt_image], dim=1)
 
                 # Set timesteps
@@ -463,17 +470,18 @@ def main():
 
                 # 5. Prepare Image latents
                 img_aug_latents = vae.encode(img_aug).latent_dist.mode()
+                #img_aug_latents = img_aug_latents * vae.config.scaling_factor
                 # TODO: multiply with scaling factor
                 
                 img_latents = vae.encode(img).latent_dist.mode()
                 img_latents = img_latents * vae.config.scaling_factor
 
-                height, width = img_latents.shape[-2:]
+                #height, width = img_latents.shape[-2:]
                 
                 # We will denoise a single step, we dont start from pure noise, so we deleted latents in the pipeline
 
                 _, spatial_attn_outputs = unet_garm(
-                    img_latents,
+                    img_aug_latents,
                     0,
                     encoder_hidden_states=prompt_embeds,
                     return_dict=False,
@@ -482,9 +490,6 @@ def main():
                 noise = torch.randn_like(img_latents)
                 
                 # unet_outfitting_encoder_hidden_states = encode_text_word_embedding(text_encoder, tokenized_text, cloth_clip, args.num_vstar).last_hidden_state
-                print("img_latents",img_latents.shape)
-                print("noise",noise.shape)
-                print("timesteps",timesteps.shape)
                 denoising_unet_input = noise_scheduler.add_noise(img_latents, noise, timesteps)
 
                 # predict the noise residual
@@ -541,40 +546,44 @@ def main():
                         with torch.no_grad():
                             val_pipe = OotdPipeline.from_pretrained(
                                 MODEL_PATH,
-                                unet_garm=unet_garm,
-                                unet_vton=unet_vton,
+                                unet_garm=unwrapped_unet_garm,
+                                unet_vton=unwrapped_unet_vton,
                                 vae=vae,
                                 torch_dtype=torch.float16,
                                 variant="fp16",
                                 use_safetensors=True,
                                 safety_checker=None,
                                 requires_safety_checker=False,
-                            ).to(accelerator.device, dtype=weight_dtype)
+                            ).to(accelerator.device)
 
 
                             val_pipe.scheduler = UniPCMultistepScheduler.from_config(val_pipe.scheduler.config)
 
-                            inference_ootd = VDPDiffusion(accelerator.device)
-                            inference_ootd.pipe = val_pipe
-                            inference_ootd.auto_processor = auto_processor
-                            inference_ootd.image_encoder = image_encoder
-                            inference_ootd.tokenizer = tokenizer
-                            inference_ootd.text_encoder = text_encoder
-
+                            # Generate a sample image for evaluation
+                            img_given = next(iter(test_dataloader))['img_aug'].to(accelerator.device)
+                            img_style = next(iter(test_dataloader))['img'].to(accelerator.device)
+                            sample_prompt = next(iter(test_dataloader))['caption']
 
                             # Extract the images
                             with torch.cuda.amp.autocast():
-                                images = inference_ootd(model_type='hd',
-                                                        category='upperbody',
-                                                        image_garm=None,
-                                                        image_vton=None,
-                                                        mask=None,
-                                                        image_ori=None,
-                                                        num_samples=1,
-                                                        num_steps=20,
-                                                        image_scale=1.0,
-                                                        seed=-1)
-                                
+                                images = val_pipe(
+                                    prompt_embeds=val_pipe._encode_prompt(
+                                        sample_prompt,
+                                        device=accelerator.device,
+                                        num_images_per_prompt=1,
+                                        do_classifier_free_guidance=True,
+                                    ),
+                                    image_garm=img_style,
+                                    image_vton=img_given,
+                                    image_ori=img_given,
+                                    num_inference_steps=20,
+                                    image_guidance_scale=1.5,
+                                    generator=torch.manual_seed(0)
+                                ).images
+
+                            # Save the generated images
+                            for i, image in enumerate(images):
+                                image.save(f"{args.output_dir}/sample_{global_step}_{i}.png")
 
                             # Compute the metrics
                             ### TODO: Bizim datasetimiz için çalışıyor mu bi bak. tüm metrikleri veren bir fonksiyon
